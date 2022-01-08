@@ -1,0 +1,162 @@
+需要记得内容：
+1、rdd的特点：5点：
+1）rdd是由一系列的partition组成的
+2）函数是作用在每一个partition（split）上的
+3）rdd之间有一系列的依赖关系
+4）分区器是作用在(K, V)格式的rdd上
+5）rdd提供一系列最佳的计算位置（体现了大数据中的“计算移动 数据不移动”的理念）
+
+问题1：rdd的分布式体现在哪些方面？
+rdd由一系列的partition组成，并且partition是分布在不同的节点上，这就体现了rdd的分布式
+
+问题2：那里体现了rdd的弹性？
+rdd由一系列的partition组成，其大小和数量都是可以改变的，默认情况下，partition的个数和block块个数相同。
+
+问题3：哪些体现了rdd的容错性？
+rdd之间存在一系列的依赖关系，子rdd可以找到对应的父rdd 通过一系列计算得出结果，这就是容错的体现
+
+
+
+2、checkpoint的执行原理：
+1）finalRdd：当rdd的job执行完毕之后，会从finalRdd从后往前回溯
+2）依赖
+3）mark：当回溯到某一个rdd调用了checkpoint方法，会对当前的rdd做一个标记
+4）hdfs：spark框架会自动启动一个新的job，重新计算到标记点rdd位置的数据（相当于重新搞个快照保存起来），并将数据持久化到指定路径，如hdfs路径（本地dir也可以）
+5）recomputation
+使用checkpoint时的常用优化手段：对rdd执行checkpoint之前，最好对这个rdd先执行cache或者persist，这样新启动的job只需要将内存中的数据拷贝到hdfs上就可以，省去了重新计算这一步。
+
+
+
+3、standalone client模式任务提交流程
+思路: 资源管理；任务管理
+
+1）client模式提交任务后，会在客户端启动driver进程（jps -l查看是SparkSubmit）
+2）driver会向master申请启动application启动的资源
+3）资源申请成功，driver会将task分发到worker端执行，启动executor进程（任务的分发,jps -l查看是CoarseGrainedExecutorBackend）
+4）worker端（executor进程）将task执行结果返回到driver端（任务结果的回收）
+总结：client模式适用于测试调试程序，driver进程是在客户端启动的，这里的客户端就是提交应用程序的当前节点，在driver端可以看到task的执行情况
+生产环境下不能使用client模式，原因是：假设要提交100个application到集群运行，driver每次都会在client端启动，那么就会导致客户端100次网卡流量暴增的问题（还有OOM的问题）
+
+
+
+3、standalone cluster模式任务提交流程
+1）cluster模式提交应用程序之后，会向master请求启动driver；
+2）master接受请求，随机在集群一台节点启动driver进程（启动时jps -l是SparkSubmit进程<此时没有DriverWrapper>，执行任务过程中是DriverWrapper<SparkSubmit消失>）；
+3）driver启动之后为当前的应用程序申请资源；
+4）driver端发送task到worker节点上执行（任务的分发）；此时driver端jps -l查看是DriverWrapper进程；
+5）worker上的executor进程将执行情况和执行结果返回给driver端（任务结果的回收）。
+
+
+=====> 总结：standalone 2种方式提交任务，driver与集群的通信（即所谓的功能）包括：
+1）应用程序资源的申请；
+2）任务的分发；
+3）结果的回收；
+4）监控task执行情况。
+
+
+
+4、yarn client模式提交任务流程
+
+执行spark-submit所在的服务器的3个jps进程：
+sparkSubmit是driver  粗木纹executorsBackend是container, executorLauncher是AM
+
+executor启动之后，会反向注册到driver, driver发送task到executor, 执行情况和结果返回给driver端
+
+AM（ExecutorLauncher）的作用：
+1）为当前Application申请资源
+2）给NM发送消息启动Executor
+3）注意：此种模式下的AM只有executorlauncher和申请资源的功能，并没有作业调度的功能
+
+
+缺点：网卡流量暴增
+
+
+====> [流程：
+1）在客户端提交一个application，会在当前客户端启动一个driver进程；
+2）driver进程启动后，会发送请求到RM（相当于standalone模式下的master），向ResourceManganer请求启动ApplicationMaster；
+3）RM收到请求之后，随机在集群中一个NM（NodeManager）启动AM，这里的NM相当于standalone模式下的worker进程；
+4）AM启动之后，会向RM请求启动一批Container资源，用于启动Executor；
+5）RM返回给AM一批NM节点（包含container）；
+6）AM会向NM发送命令启动Executor；
+7）Executor启动之后，会反向注册到Driver（Executor主动告诉Driver自己的信息），Driver发送task到Executor上执行（即作业调度），并监督task的执行情况和回收结果
+
+yarn client模式同样是适用于测试，因为Driver运行在本地，Driver会与yarn集群中的Executor进行大量的通信，提交的application过多同样会造成客户机网卡流量的大量增加
+
+AM（ExecutorLauncher）的作用：
+1）为当前Application申请资源
+2）给NM发送消息启动Executor
+3）注意：此种模式下的AM只有executorlauncher和申请资源的功能，并没有作业调度的功能
+]
+
+
+4、yarn cluster模式提交任务流程
+====> [流程：
+1）在客户端提交application（此时客户端jps -l查看，有SparkSubmit），发送请求到RM，请求启动AM；
+2）RM收到请求之后，在集群中随机找一台NM，启动AM（相当于Driver端）；
+3）AM启动之后（相当于Driver端），发送请求到RM，请求一批Container，用于启动Executor；
+4）RM接受请求，返回一批NM给AM，用于启动Executor；
+5）AM连接NM启动Executor，Executor启动之后会反向注册到Driver；
+6）Driver发送task到Executor执行。
+
+总结：
+
+yarn-cluster模式主要用于生产环境中，因为Driver运行在yarn集群中某一个NM中，每次提交任务的Driver所在的机器都是不再是提交任务的客户端机器，而是多个NM节点中的一台，不会产生某一台机器网卡流量激增的现象，但是同样有缺点，任务提交之后不能查看日志，只能通过yarn查看日志
+
+AM的作用：
+1）为当前Application申请资源
+2）给NM发送消息启动Executor
+3）注意：此种模式下的AM不仅有executorlauncher和申请资源的功能，还有作业调度的功能
+
+]
+
+
+[查看application对应日志的方法：yarn logs -applicationId appId(需要yarn-site.xml添加如下内容 开启日志聚合设置)
+见：https://www.bilibili.com/video/BV1ag411K7jZ?p=23&spm_id_from=pageDriver
+
+yarn-site.xml添加：
+<property>
+<name>yarn.log-aggregatiion-enable</name>
+<value>true</value>
+</property>
+
+<property>
+<name>yarn.log.server.url</name>
+<value>http://node03:19888/jobhistory/logs</value>
+</property>
+
+<property>
+<name>yarn.nodemanager.remote-app-log-dir</name>
+<value>/tmp/logs</value>
+</property>
+
+
+mapred-site.xml添加：
+<property>
+<name>mapreduce.framework.name</name>
+<value>yarn</value>
+</property>
+
+<property>
+<name>mapreduce.jobhistory.address</name>
+<value>node03:10020</value>
+</property>
+
+<property>
+<name>mapreduce.jobhistory.webapp.address</name>
+<value>node03:19888</value>
+</property>
+
+<property>
+<name>mapreduce.jobhistory.done-dir</name>
+<value>/history/done</value>
+</property>
+
+<!-- 正在运行的任务信息临时目录 -->
+<property>
+<name>mapreduce.jobhistory.intermediate.done-dir</name>
+<value>/history/done/done_intermediate</value>
+</property>
+
+
+====> 启动yarn历史服务命令：mr-jobhistpry-daemon.sh start historyserver
+]
